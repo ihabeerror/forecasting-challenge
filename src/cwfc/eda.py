@@ -18,7 +18,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from cwfc.preprocess import STEP_SECONDS, TRAIN_SIZE, load_readings
+STEP_SECONDS = 300
+TRAIN_SIZE = 110
 
 SURFACE, INK, MUTED, GRID = "#fcfcfb", "#0b0b0b", "#898781", "#e1e0d9"
 BLUE, ORANGE, AQUA = "#2a78d6", "#eb6834", "#1baf7a"
@@ -166,7 +167,7 @@ def main() -> None:
     data, out = Path(args.data), Path(args.out)
     (out / "figures").mkdir(parents=True, exist_ok=True)
 
-    full = load_readings(str(data / "vm_cpu_readings.csv"))
+    full = pd.read_csv(data / "vm_cpu_readings.csv").sort_values(["timestamp", "vm_id"])
     metadata = pd.read_csv(data / "vm_metadata.csv")
 
     train_ts = np.sort(full["timestamp"].unique())[:TRAIN_SIZE]
