@@ -1,9 +1,5 @@
 """Section A workload analysis: prints a summary and writes figures.
 
-Structural checks (cadence, gaps, duplicates) use the full file. Every
-analysis that looks at CPU values uses only the first TRAIN_SIZE timestamps,
-so the holdout is never inspected.
-
 Run: python -m cwfc.eda --data challenge_data --out reports
 """
 from __future__ import annotations
@@ -19,7 +15,6 @@ import numpy as np
 import pandas as pd
 
 STEP_SECONDS = 300
-TRAIN_SIZE = 110
 
 SURFACE, INK, MUTED, GRID = "#fcfcfb", "#0b0b0b", "#898781", "#e1e0d9"
 BLUE, ORANGE, AQUA = "#2a78d6", "#eb6834", "#1baf7a"
@@ -65,7 +60,7 @@ def churn_report(metadata: pd.DataFrame, window_start: int, window_end: int) -> 
     deleted = metadata.timestamp_vm_deleted
     return [
         "",
-        f"== VM lifetimes and churn (training window {window_start}s-{window_end}s) ==",
+        f"== VM lifetimes and churn (window {window_start}s-{window_end}s) ==",
         f"created at/before window start: {(created <= window_start).sum()} of {len(metadata)}",
         f"created inside window: {((created > window_start) & (created <= window_end)).sum()}",
         f"deleted inside window: {(deleted <= window_end).sum()}",
@@ -112,6 +107,83 @@ def segment_report(readings: pd.DataFrame, metadata: pd.DataFrame) -> list[str]:
         stats = merged.groupby(col).avg_cpu.agg(["mean", "median", "std", "count"]).round(2)
         out += [f"-- by {col} --", stats.to_string()]
     return out
+
+
+def group_contribution_report(readings: pd.DataFrame, metadata: pd.DataFrame, top: int = 8) -> list[str]:
+    """How much each subscription / deployment contributes to the aggregate CPU.
+
+    A group's contribution at time t is the sum of its VMs' avg_cpu divided by the
+    fleet size, so contributions add up to the aggregate. `share_of_cpu` is the
+    group's slice of the aggregate level; `share_of_variation` is its slice of the
+    aggregate's movement over time (covariance with the aggregate / its variance,
+    which sums to 100% across groups).
+    """
+    merged = readings.merge(metadata[["vm_id", "subscription_id", "deployment_id"]], on="vm_id")
+    n_vms = readings.vm_id.nunique()
+    agg = readings.groupby("timestamp").avg_cpu.mean()
+    agg_dev = agg - agg.mean()
+    out = ["", "== group contribution to aggregate CPU =="]
+    for col in ("subscription_id", "deployment_id"):
+        contrib = merged.groupby(["timestamp", col]).avg_cpu.sum().unstack(fill_value=0) / n_vms
+        sizes = metadata.groupby(col).size()
+        table = pd.DataFrame({
+            "vms": sizes,
+            "mean_cpu": contrib.mean() * n_vms / sizes,
+            "share_of_cpu": contrib.mean() / agg.mean(),
+            "share_of_variation": (contrib - contrib.mean()).mul(agg_dev, axis=0).sum() / (len(agg) - 1) / agg.var(),
+        })
+        ranked = table.sort_values("share_of_cpu", ascending=False)
+        cum = ranked.share_of_cpu.cumsum()
+        n = len(ranked)
+        conc = {f"top {p}%": round(float(cum.iloc[max(int(n * p / 100), 1) - 1]), 3) for p in (1, 5, 10, 25)}
+        shown = ranked.head(top).copy()
+        shown.index = [str(i)[:8] for i in shown.index]
+        out += [
+            f"-- {col}: {n} groups, share of aggregate CPU held by top x% of groups --",
+            str(conc),
+            f"top {top} by share of CPU:",
+            shown.round(3).to_string(),
+            f"top {top} by share of variation:",
+            _short_index(table.sort_values("share_of_variation", ascending=False).head(top)).round(3).to_string(),
+        ]
+    return out
+
+
+def _entropy(counts: pd.Series) -> float:
+    p = counts / counts.sum()
+    return float(-(p * np.log(p)).sum())
+
+
+def id_relationship_report(metadata: pd.DataFrame) -> list[str]:
+    """How redundant subscription_id and deployment_id are with each other."""
+    pairs = metadata.groupby(["subscription_id", "deployment_id"]).size()
+    n_sub = metadata.subscription_id.nunique()
+    n_dep = metadata.deployment_id.nunique()
+    deps_per_sub = metadata.groupby("subscription_id").deployment_id.nunique()
+    subs_per_dep = metadata.groupby("deployment_id").subscription_id.nunique()
+    vm_deps = metadata.subscription_id.map(deps_per_sub)
+    vm_subs = metadata.deployment_id.map(subs_per_dep)
+    h_sub = _entropy(metadata.groupby("subscription_id").size())
+    h_dep = _entropy(metadata.groupby("deployment_id").size())
+    h_joint = _entropy(pairs)
+    nmi = 2 * (h_sub + h_dep - h_joint) / (h_sub + h_dep)
+    return [
+        "",
+        "== subscription vs deployment relationship ==",
+        f"subscriptions={n_sub} deployments={n_dep} distinct pairs={len(pairs)} "
+        f"(identical grouping if all three are equal)",
+        f"deployments per subscription: {deps_per_sub.value_counts().sort_index().to_dict()}",
+        f"subscriptions per deployment: {subs_per_dep.value_counts().sort_index().to_dict()}",
+        f"VMs whose subscription has 1 deployment: {(vm_deps == 1).mean():.1%}; "
+        f"whose deployment has 1 subscription: {(vm_subs == 1).mean():.1%}",
+        f"normalized mutual information: {nmi:.3f} (1.0 = one determines the other)",
+    ]
+
+
+def _short_index(frame: pd.DataFrame) -> pd.DataFrame:
+    frame = frame.copy()
+    frame.index = [str(i)[:8] for i in frame.index]
+    return frame
 
 
 def plot_mean_cpu(mean_cpu: pd.Series, path: Path) -> None:
@@ -167,27 +239,33 @@ def main() -> None:
     data, out = Path(args.data), Path(args.out)
     (out / "figures").mkdir(parents=True, exist_ok=True)
 
-    full = pd.read_csv(data / "vm_cpu_readings.csv").sort_values(["timestamp", "vm_id"])
+    readings = pd.read_csv(data / "vm_cpu_readings.csv").sort_values(["timestamp", "vm_id"])
     metadata = pd.read_csv(data / "vm_metadata.csv")
 
-    train_ts = np.sort(full["timestamp"].unique())[:TRAIN_SIZE]
-    readings = full[full["timestamp"].isin(train_ts)]
     mean_cpu = readings.groupby("timestamp").avg_cpu.mean()
     share = concentration(readings)
 
-    lines = (coverage_report(full)
-             + churn_report(metadata, int(train_ts[0]), int(train_ts[-1]))
+    lines = (coverage_report(readings)
+             + churn_report(metadata, int(readings.timestamp.min()), int(readings.timestamp.max()))
              + distribution_report(readings) + temporal_report(mean_cpu)
              + segment_report(readings, metadata)
+             + id_relationship_report(metadata)
+             + group_contribution_report(readings, metadata)
              + ["", "== concentration (share of all CPU) ==", share.round(3).to_string()])
     text = "\n".join(lines)
-    print(text)
-    (out / "workload_summary.txt").write_text(text, encoding="utf-8")
+    summary_path = out / "workload_summary.txt"
+    summary_path.write_text(text, encoding="utf-8")
+    print(f"wrote {summary_path}")
 
-    plot_mean_cpu(mean_cpu, out / "figures" / "mean_cpu.png")
-    plot_distribution(readings, out / "figures" / "cpu_distribution.png")
-    plot_segments(readings, metadata, out / "figures" / "segments.png")
-    plot_concentration(share, out / "figures" / "concentration.png")
+    figures = {
+        "mean_cpu.png": lambda p: plot_mean_cpu(mean_cpu, p),
+        "cpu_distribution.png": lambda p: plot_distribution(readings, p),
+        "segments.png": lambda p: plot_segments(readings, metadata, p),
+        "concentration.png": lambda p: plot_concentration(share, p),
+    }
+    for name, draw in figures.items():
+        draw(out / "figures" / name)
+        print(f"wrote {out / 'figures' / name}")
 
 
 if __name__ == "__main__":
