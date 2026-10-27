@@ -6,6 +6,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from cwfc.data_files import data_file
+
 STEP_SECONDS = 300
 HORIZON = 24
 
@@ -114,8 +116,8 @@ def main() -> None:
     args = parser.parse_args()
     data, out = Path(args.data), Path(args.out)
 
-    readings = load_readings(str(data / "vm_cpu_readings.csv"))
-    metadata = pd.read_csv(data / "vm_metadata.csv")
+    readings = load_readings(str(data_file(data, "vm_cpu_readings")))
+    metadata = pd.read_csv(data_file(data, "vm_metadata"))
     series = build_target_series(readings)
     history = build_history(series, build_fleet_series(readings, metadata))
     train, holdout = split_train_holdout(history)

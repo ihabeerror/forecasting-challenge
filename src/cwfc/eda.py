@@ -7,36 +7,15 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from cwfc.data_files import data_file
+from cwfc.style import AQUA, BLUE, GRID, INK, ORANGE, SURFACE, plt
+from cwfc.style import save_figure as _save
+from cwfc.style import style_axes as _style
+
 STEP_SECONDS = 300
-
-SURFACE, INK, MUTED, GRID = "#fcfcfb", "#0b0b0b", "#898781", "#e1e0d9"
-BLUE, ORANGE, AQUA = "#2a78d6", "#eb6834", "#1baf7a"
-
-
-def _style(ax: plt.Axes, title: str, xlabel: str, ylabel: str) -> None:
-    ax.set_facecolor(SURFACE)
-    ax.set_title(title, loc="left", color=INK, fontsize=11)
-    ax.set_xlabel(xlabel, color=MUTED)
-    ax.set_ylabel(ylabel, color=MUTED)
-    ax.grid(axis="y", color=GRID, linewidth=0.8)
-    ax.tick_params(colors=MUTED)
-    for side in ("top", "right", "left"):
-        ax.spines[side].set_visible(False)
-    ax.spines["bottom"].set_color(GRID)
-
-
-def _save(fig: plt.Figure, path: Path) -> None:
-    fig.patch.set_facecolor(SURFACE)
-    fig.tight_layout()
-    fig.savefig(path, dpi=140)
-    plt.close(fig)
 
 
 def coverage_report(readings: pd.DataFrame) -> list[str]:
@@ -239,8 +218,8 @@ def main() -> None:
     data, out = Path(args.data), Path(args.out)
     (out / "figures").mkdir(parents=True, exist_ok=True)
 
-    readings = pd.read_csv(data / "vm_cpu_readings.csv").sort_values(["timestamp", "vm_id"])
-    metadata = pd.read_csv(data / "vm_metadata.csv")
+    readings = pd.read_csv(data_file(data, "vm_cpu_readings")).sort_values(["timestamp", "vm_id"])
+    metadata = pd.read_csv(data_file(data, "vm_metadata"))
 
     mean_cpu = readings.groupby("timestamp").avg_cpu.mean()
     share = concentration(readings)

@@ -1,6 +1,6 @@
 """End-to-end pipeline: preprocess, validate, select, forecast the holdout.
 
-Run: python -m cwfc.predict --data challenge_data --output predictions.csv
+Run: python -m cwfc.predict --data challenge_data --output predictions.csv  (writes reports/predictions.csv)
 
 Model selection uses only backtests inside the training window. The holdout
 targets are read once, after predictions.csv is written, to score the result.
@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from cwfc.data_files import data_file
 from cwfc.evaluation import backtest, headroom_margin, mae_by_horizon, summarize
 from cwfc.metrics import mae, rmse
 from cwfc.models import Persistence, default_forecasters
@@ -36,14 +37,18 @@ PEAK_QUANTILE = 0.9
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", default="challenge_data")
-    parser.add_argument("--output", default="predictions.csv")
+    parser.add_argument("--output", default="predictions.csv",
+                        help="a bare file name is placed in --reports; a path is used as given")
     parser.add_argument("--reports", default="reports")
     args = parser.parse_args()
     data, reports = Path(args.data), Path(args.reports)
     reports.mkdir(parents=True, exist_ok=True)
+    output = Path(args.output)
+    if output.parent == Path("."):
+        output = reports / output
 
-    readings = load_readings(str(data / "vm_cpu_readings.csv"))
-    metadata = pd.read_csv(data / "vm_metadata.csv")
+    readings = load_readings(str(data_file(data, "vm_cpu_readings")))
+    metadata = pd.read_csv(data_file(data, "vm_metadata"))
     history = build_history(build_target_series(readings), build_fleet_series(readings, metadata))
     train, holdout = split_train_holdout(history, HORIZON)
     print(f"history: {len(history)} rows -> train={len(train)} holdout={len(holdout)}")
@@ -78,21 +83,28 @@ def main() -> None:
     })
     if not np.isfinite(predictions[[COUNT, TARGET]].to_numpy(dtype=float)).all():
         raise ValueError("non-finite prediction")
-    predictions.to_csv(args.output, index=False)
-    print(f"wrote {args.output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    predictions.to_csv(output, index=False)
+    print(f"wrote {output}")
 
     bands = predictions.assign(cpu_upper=np.clip(cpu_forecast + margin, 0.0, 100.0), margin=margin)
     bands.to_csv(reports / "forecast_bands.csv", index=False)
     print(f"wrote {reports / 'forecast_bands.csv'} (headroom margin {margin:.3f} pts)")
 
     # Final scoring on the holdout, after selection and after predictions are written.
-    holdout_rows = []
+    holdout_rows, holdout_forecasts = [], []
     for forecaster in forecasters:
         try:
             forecast = np.clip(forecaster.fit(train).predict(train, HORIZON), 0.0, 100.0)
         except ValueError:
             continue
         actual = holdout[TARGET].to_numpy(dtype=float)
+        holdout_forecasts.append(pd.DataFrame({
+            "model": forecaster.name,
+            "timestamp": holdout["timestamp"].to_numpy(),
+            "actual": actual,
+            "forecast": forecast,
+        }))
         peak = actual >= peak_threshold
         holdout_rows.append({
             "model": forecaster.name,
@@ -109,7 +121,10 @@ def main() -> None:
         holdout_scores["mae_vs_persistence"] = holdout_scores.mae / reference.iloc[0]
     holdout_scores["count_mae"] = mae(holdout[COUNT], np.full(len(holdout), count_forecast))
     holdout_scores.to_csv(reports / "holdout_scores.csv", index=False)
-    print(f"wrote {reports / 'holdout_scores.csv'}")
+    pd.concat(holdout_forecasts, ignore_index=True).to_csv(reports / "holdout_forecasts.csv", index=False)
+    history[["timestamp", TARGET]].assign(split=["train"] * len(train) + ["holdout"] * len(holdout)) \
+        .to_csv(reports / "history.csv", index=False)
+    print(f"wrote {reports / 'holdout_scores.csv'}, holdout_forecasts.csv, history.csv")
 
 
 if __name__ == "__main__":
