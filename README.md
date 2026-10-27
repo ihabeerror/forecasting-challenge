@@ -69,6 +69,8 @@ python -m pytest -q                                        # tests
 - `active_vm_count` is the number of distinct VMs reporting.
 - `aggregate_cpu_utilization` is the mean of their `avg_cpu`.
 
+**Missing readings and gaps.** The release has no null values, no duplicate (VM, timestamp) pairs and no gaps in the 5-minute cadence (`cwfc.eda` checks this). The mean is taken over the VMs reporting at each timestamp. Nothing is resampled or imputed. If the 5-minute spacing is ever broken, `build_target_series` raises an error instead of filling it silently.
+
 **Split.** The last 24 timestamps are the holdout and the rest is training. Holdout values are never used for fitting, feature selection, tuning or model selection. They are read only after `predictions.csv` is written, to score the result.
 
 **Features.** Each forecast origin uses only rows at or before it:
@@ -79,6 +81,8 @@ python -m pytest -q                                        # tests
 - fleet statistics observed at that timestamp: p95, spread across VMs, share above 50%, mean max CPU and per-category mean
 
 Metadata lifetime statistics (`avg_cpu`, `max_cpu`, `p95_max_cpu`) and deletion times describe the whole VM life, so they are excluded as leakage.
+
+Calendar features (hour, day of week) are not used. The trace covers about 11 hours, so there is no full daily or weekly cycle to learn from, and the raw timestamp would only let a model extrapolate a trend. Every feature is computed from timestamps at or before the origin.
 
 **Models** ([`models.py`](src/cwfc/models.py)):
 - Baselines: persistence, 6-step moving average and seasonal-naive (period 24).
