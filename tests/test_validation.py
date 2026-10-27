@@ -1,5 +1,6 @@
 import pandas as pd
-from cwfc.validation import rolling_origin_splits
+import pytest
+from cwfc.validation import expanding_origins, rolling_origin_splits
 
 
 def test_rolling_origin_splits_are_temporal():
@@ -10,3 +11,10 @@ def test_rolling_origin_splits_are_temporal():
     assert len(splits) == 3
     assert splits[0].train_end < splits[0].validation_start
     assert splits[0].validation_end < splits[1].validation_start
+
+
+def test_expanding_origins_end_at_last_row():
+    assert expanding_origins(110, 24, 60, 6) == [62, 68, 74, 80, 86]
+    assert expanding_origins(30, 24, 10, 6) == []
+    with pytest.raises(ValueError):
+        expanding_origins(110, 24, 0, 6)

@@ -82,7 +82,7 @@ class DirectModel(Forecaster):
         complete = ~np.isnan(values).any(axis=1)
         cpu = history[TARGET].to_numpy(dtype=float)
         xs, ys = [], []
-        for h in range(1, self.horizon + 1):
+        for h in range(1, min(self.horizon, len(cpu) - 1) + 1):
             origins = np.flatnonzero(complete[: len(cpu) - h])
             if len(origins) == 0:
                 continue

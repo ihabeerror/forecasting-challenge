@@ -35,6 +35,12 @@ def test_models_follow_a_linear_trend(model):
     np.testing.assert_allclose(forecast, 5 + 0.1 * np.arange(60, 66), atol=0.05)
 
 
+def test_direct_model_with_history_shorter_than_horizon():
+    history = _history(16)
+    forecast = DirectModel(ridge(), "d", horizon=24).fit(history).predict(history, 24)
+    assert forecast.shape == (24,)
+
+
 def test_backtest_never_fits_on_forecast_rows():
     seen = []
 

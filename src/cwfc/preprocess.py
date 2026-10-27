@@ -7,11 +7,11 @@ import numpy as np
 import pandas as pd
 
 STEP_SECONDS = 300
-TRAIN_SIZE = 110
 HORIZON = 24
 
 TARGET = "aggregate_cpu_utilization"
-CPU_LAGS = (1, 2, 3, 6)
+COUNT = "active_vm_count"
+CPU_LAGS = (1, 2, 5)
 ROLL_WINDOW = 6
 HOT_THRESHOLD = 50.0
 
@@ -45,16 +45,17 @@ def build_target_series(readings: pd.DataFrame) -> pd.DataFrame:
 
 
 def active_vm_count_from_lifetimes(metadata: pd.DataFrame, timestamps: pd.Series) -> pd.Series:
-    """Count VMs with created <= t < deleted, from the known VM lifetimes."""
+    """Count VMs with created <= t < deleted. A cross-check only: deletion times
+    are not known in advance in production, so this is not used to forecast."""
     t = np.asarray(timestamps)[None, :]
     created = metadata["timestamp_vm_created"].to_numpy()[:, None]
     deleted = metadata["timestamp_vm_deleted"].to_numpy()[:, None]
     counts = ((created <= t) & (t < deleted)).sum(axis=0)
-    return pd.Series(counts, index=timestamps.index, name="active_vm_count")
+    return pd.Series(counts, index=timestamps.index, name=COUNT)
 
 
 def build_fleet_series(readings: pd.DataFrame, metadata: pd.DataFrame) -> pd.DataFrame:
-    """Per-timestamp fleet statistics (same-timestamp values, not yet lagged)."""
+    """Per-timestamp fleet statistics observed at that timestamp."""
     grouped = readings.groupby("timestamp")
     fleet = pd.DataFrame({
         "cpu_p95": grouped.avg_cpu.quantile(0.95),
@@ -68,43 +69,46 @@ def build_fleet_series(readings: pd.DataFrame, metadata: pd.DataFrame) -> pd.Dat
     return fleet.join(by_category).sort_index().reset_index()
 
 
-def build_feature_table(series: pd.DataFrame, fleet: pd.DataFrame) -> pd.DataFrame:
-    """One row per timestamp: targets plus features built only from earlier rows.
+def build_history(series: pd.DataFrame, fleet: pd.DataFrame) -> pd.DataFrame:
+    """One row per timestamp: targets plus the fleet statistics observed then."""
+    history = series.merge(fleet, on="timestamp", how="left")
+    return history.sort_values("timestamp").reset_index(drop=True)
 
-    Every feature at row t is computed from shifted values (t-1 and earlier), so
-    it is available before the value at t is observed. The first rows contain
-    NaN where there is not enough history; drop them when fitting.
+
+def fleet_columns(history: pd.DataFrame) -> list[str]:
+    return [c for c in history.columns if c not in ("timestamp", COUNT, TARGET)]
+
+
+def target_features(cpu: pd.Series) -> pd.DataFrame:
+    """Features from the target's own history, known at each row.
+
+    Row o uses only values at o and earlier, so it describes what is known at
+    a forecast origin o. Early rows are NaN where history is too short.
     """
-    frame = series.merge(fleet, on="timestamp", how="left").sort_values("timestamp").reset_index(drop=True)
-    cpu = frame[TARGET]
-
+    cpu = cpu.astype(float)
+    features = pd.DataFrame({"cpu_now": cpu}, index=cpu.index)
     for k in CPU_LAGS:
-        frame[f"cpu_lag{k}"] = cpu.shift(k)
-    frame["cpu_lag1_diff"] = frame["cpu_lag1"] - frame["cpu_lag2"]
-    past = cpu.shift(1)
-    frame[f"cpu_roll_mean_{ROLL_WINDOW}"] = past.rolling(ROLL_WINDOW).mean()
-    frame[f"cpu_roll_std_{ROLL_WINDOW}"] = past.rolling(ROLL_WINDOW).std()
-
-    for col in fleet.columns.drop("timestamp"):
-        frame[f"{col}_lag1"] = frame[col].shift(1)
-        frame = frame.drop(columns=col)
-    return frame
+        features[f"cpu_lag{k}"] = cpu.shift(k)
+    features["cpu_change"] = cpu - cpu.shift(1)
+    features[f"cpu_roll_mean_{ROLL_WINDOW}"] = cpu.rolling(ROLL_WINDOW).mean()
+    features[f"cpu_roll_std_{ROLL_WINDOW}"] = cpu.rolling(ROLL_WINDOW).std()
+    return features
 
 
-def feature_columns(frame: pd.DataFrame) -> list[str]:
-    """Columns that are model inputs: everything except timestamp and targets."""
-    return [c for c in frame.columns if c not in ("timestamp", "active_vm_count", TARGET)]
+def origin_features(history: pd.DataFrame) -> pd.DataFrame:
+    """Everything known at each forecast origin: target history plus fleet stats at that row."""
+    return target_features(history[TARGET]).join(history[fleet_columns(history)])
 
 
-def split_train_holdout(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Chronological split: first 110 rows train, final 24 rows holdout."""
-    if len(frame) != TRAIN_SIZE + HORIZON:
-        raise ValueError(f"expected {TRAIN_SIZE + HORIZON} rows, got {len(frame)}")
-    return frame.iloc[:TRAIN_SIZE].copy(), frame.iloc[TRAIN_SIZE:].copy()
+def split_train_holdout(frame: pd.DataFrame, horizon: int = HORIZON) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Chronological split: the final `horizon` rows are the holdout."""
+    if len(frame) <= horizon:
+        raise ValueError(f"need more than {horizon} rows, got {len(frame)}")
+    return frame.iloc[:-horizon].copy(), frame.iloc[-horizon:].copy()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build the feature table and run basic checks.")
+    parser = argparse.ArgumentParser(description="Build the history and origin features, run basic checks.")
     parser.add_argument("--data", default="challenge_data")
     parser.add_argument("--out", default="reports")
     args = parser.parse_args()
@@ -113,18 +117,19 @@ def main() -> None:
     readings = load_readings(str(data / "vm_cpu_readings.csv"))
     metadata = pd.read_csv(data / "vm_metadata.csv")
     series = build_target_series(readings)
-    frame = build_feature_table(series, build_fleet_series(readings, metadata))
-    train, holdout = split_train_holdout(frame)
-    print(f"built feature table: {frame.shape[0]} rows, {len(feature_columns(frame))} features")
+    history = build_history(series, build_fleet_series(readings, metadata))
+    train, holdout = split_train_holdout(history)
+    features = origin_features(history)
+    print(f"built history: {len(history)} rows, {features.shape[1]} origin features")
     print(f"split: train={len(train)} holdout={len(holdout)}")
 
     counts = active_vm_count_from_lifetimes(metadata, series["timestamp"])
-    print(f"lifetime-based active_vm_count matches readings: {bool((counts == series.active_vm_count).all())}")
-    print(f"rows with missing features (drop before fitting): {int(frame[feature_columns(frame)].isna().any(axis=1).sum())}")
+    print(f"lifetime-based active_vm_count matches readings: {bool((counts == series[COUNT]).all())}")
+    print(f"origins with incomplete features (skipped when fitting): {int(features.isna().any(axis=1).sum())}")
 
     out.mkdir(parents=True, exist_ok=True)
-    frame.to_csv(out / "feature_table.csv", index=False)
-    print(f"wrote {out / 'feature_table.csv'}")
+    history[["timestamp", COUNT, TARGET]].join(features).to_csv(out / "origin_features.csv", index=False)
+    print(f"wrote {out / 'origin_features.csv'}")
 
 
 if __name__ == "__main__":
