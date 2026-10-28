@@ -19,16 +19,12 @@ def rmse(y_true, y_pred) -> float:
     return float(np.sqrt(np.mean((a - b) ** 2)))
 
 
-def smape(y_true, y_pred, eps: float = 1e-8) -> float:
-    a = np.asarray(y_true, dtype=float)
-    b = np.asarray(y_pred, dtype=float)
-    if a.shape != b.shape:
-        raise ValueError("y_true and y_pred must have the same shape")
-    denom = np.maximum(np.abs(a) + np.abs(b), eps)
-    return float(np.mean(2.0 * np.abs(a - b) / denom) * 100.0)
-
-
 def normalized_mae(y_true, y_pred, baseline_pred) -> float:
+    """Model MAE divided by baseline MAE on the same points; below 1 beats the baseline.
+
+    The denominator is the baseline error, not the target value, so near-zero
+    CPU readings cannot blow it up. A perfect baseline gives 0 or inf.
+    """
     model_mae = mae(y_true, y_pred)
     baseline_mae = mae(y_true, baseline_pred)
     if baseline_mae == 0:

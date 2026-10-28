@@ -1,0 +1,172 @@
+\documentclass[11pt,a4paper]{article}
+
+% Plain, Word-like layout: Calibri-style font, normal margins, no academic styling.
+\usepackage[T1]{fontenc}
+\usepackage[sfdefault]{carlito}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage[skip=4pt]{parskip}
+\usepackage{titlesec}
+\titlespacing*{\section}{0pt}{10pt}{4pt}
+\setlength{\textfloatsep}{8pt}
+\setlength{\floatsep}{8pt}
+\setlength{\intextsep}{8pt}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{float}
+\usepackage[font=small,labelfont=bf]{caption}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+
+\graphicspath{{figures/}}
+\setlist{itemsep=2pt, topsep=4pt}
+\newcommand{\m}[1]{\texttt{#1}}
+
+\title{\textbf{Cloud Workload Forecasting}\\[4pt]\large Two-hour forecast of active VMs and aggregate CPU on the Azure VM trace}
+\author{Mustafa Aksel Kavak}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+% ------------------------------------------------------------------
+\section{Executive summary}
+
+This report describes a pipeline that forecasts the number of active VMs and the aggregate CPU utilisation of 10,000 Azure VMs for the final two hours of an 11.1-hour trace. The data was complete and regular, so the two targets were built directly on the native 5-minute grid. The first 110 timestamps were used for training and the last 24 were kept as the holdout.
+
+The analysis showed that the workload is very stable at fleet level. No VM was created or deleted during the window, so the active VM count stayed at 10,000 and a last-value forecast predicted it exactly. Aggregate CPU stayed between 8.98\% and 9.91\%, although individual VMs ranged from idle to fully loaded. This meant that the forecasting problem was mainly about small movements around a level of about 9.4\%, and that a simple baseline would be hard to beat.
+
+Three baselines (persistence, a 6-step moving average and a seasonal-naive forecast) were compared with ridge regression and gradient-boosted trees, each in a recursive and a direct form. Models were compared with an expanding-window backtest inside the training data. Recursive ridge regression had the lowest validation error, 38\% below persistence, and was selected. On the holdout, however, its error was almost twice that of persistence. All validation windows covered a period in which CPU was falling, while the holdout period was rising, so the trend-following models under-forecast it. The main lesson is that the validation design could not show this weakness, because the 110 training points contained only one kind of movement.
+
+Based on these results, the recommended policy is to provision for the last observed CPU level plus a margin of 0.60 points, which is the 95th percentile of the largest two-hour rise seen in the training data. The learned models should only replace this baseline after they have been validated on a longer and more varied history.
+
+% ------------------------------------------------------------------
+\section{Data understanding and preprocessing}
+
+The release contains 1,340,000 CPU readings from 10,000 VMs at 134 timestamps, spaced 300 seconds apart. There were no missing values, no duplicate VM--timestamp pairs and no gaps in the time grid, and every VM reported at every timestamp. As a result, no resampling or imputation was needed, and the native 5-minute cadence was kept. For other data, the pipeline drops readings without \m{avg\_cpu} and duplicate VM--timestamp rows, and fills a timestamp with no readings with the last observed values, with a warning. Filled rows keep the features on a regular grid but are never scored or used as holdout timestamps.
+
+The active VM count was calculated as the number of distinct VMs reporting at each timestamp, and aggregate CPU as the mean of their \m{avg\_cpu} values. The full series was built first and then split chronologically into 110 training and 24 holdout timestamps. The holdout values were only read after \m{predictions.csv} had been written.
+
+Some metadata fields could not be used as features. The fields \m{avg\_cpu}, \m{max\_cpu} and \m{p95\_max\_cpu} summarise each VM over its whole lifetime, which includes the holdout period, and VM deletion times are not known in advance in a real system. Using any of them would have leaked future information into the model, so they were excluded. The \m{vm\_category} label needs more care. According to the Resource Central paper (Cortez et al., SOSP 2017, section 3.6), the class is inferred from at least three days of each VM's CPU utilisation, and VMs that run for less than three days are labelled ``Unknown''. In this dataset, Unknown VMs do have much shorter lifetimes (median 87 hours against 720 hours), which is consistent with that description. The label may therefore include information from after the forecast origin. Its effect is limited, because it only enters the per-category mean CPU features, which are used by the direct models and not by the selected recursive model.
+
+% ------------------------------------------------------------------
+\section{Workload analysis}
+
+\begin{figure}[H]
+  \centering
+  \begin{subfigure}{0.49\textwidth}\includegraphics[width=\linewidth]{mean_cpu.png}\end{subfigure}
+  \hfill
+  \begin{subfigure}{0.49\textwidth}\includegraphics[width=\linewidth]{cpu_distribution.png}\end{subfigure}
+  \caption{Left: aggregate CPU over the full trace. Right: distribution of VM-level CPU readings.}
+\end{figure}
+
+All VMs were created before the window began and none was deleted during it, with a median planned lifetime of about 720 hours. The VM count therefore has no dynamics in this dataset. This is a result of how the subset was selected rather than a property of real fleets, so the count forecast in this project cannot be considered tested.
+
+CPU usage at VM level is strongly skewed. The median reading is 5.1\% and the 95th percentile is 37\%. Almost half of the VMs (46\%) average below 5\%, while only 2.2\% average above 50\%. The top 10\% of VMs account for 44\% of all CPU. This means that capacity risk depends on a small group of busy VMs, and that the fleet average hides most of the individual variation.
+
+Aggregate CPU reached its highest values around 4.5 to 5.4 hours into the trace (9.91\%) and its lowest around 9.3 hours (8.98\%). The autocorrelation was 0.68 at one step, 0.53 at 30 minutes and only 0.13 at two hours. The series therefore depends strongly on its recent values but carries little information two hours ahead, which limits how much any model can gain over persistence at this horizon. The trace is also too short to contain a daily cycle, so calendar features and seasonal patterns were not expected to help. Since the workload analysis covers all 134 timestamps, the autocorrelation was recomputed on the 110 training timestamps alone. It gave the same picture (0.67 at one step and $-0.03$ at two hours), so the choice of lag features does not depend on the holdout.
+
+VM categories differ in behaviour. Interactive VMs have a higher mean CPU (11.5\%) and a larger spread (standard deviation 17.0) than delay-insensitive VMs (8.2\% and 12.0). Since interactive workloads are also the most sensitive to slowdowns, they were later given more weight in the capacity recommendation.
+
+Subscription and deployment IDs turned out to describe almost the same grouping (2,324 subscriptions against 2,359 deployments, normalised mutual information 0.999), so only subscriptions were analysed further. The top 1\% of subscriptions account for 29\% of all CPU, and the single most variable subscription explains about 11\% of the variation in the aggregate. These few subscriptions are useful indicators for early warning of load increases.
+
+\begin{figure}[H]
+  \centering
+  \begin{subfigure}{0.49\textwidth}\includegraphics[width=\linewidth]{segments.png}\end{subfigure}
+  \hfill
+  \begin{subfigure}{0.49\textwidth}\includegraphics[width=\linewidth]{concentration.png}\end{subfigure}
+  \caption{Left: CPU by VM segment. Right: share of total CPU held by the top-ranked VMs.}
+\end{figure}
+
+% ------------------------------------------------------------------
+\section{Forecasting approach}
+
+All features were computed at a forecast origin using only data available at that time. From the target series these were the current value, lags of 1, 2 and 5 steps, the last change, and the 6-step rolling mean and standard deviation. These were combined with fleet statistics from the same timestamp: the 95th-percentile VM CPU, the spread across VMs, the share of VMs above 50\%, the mean of \m{max\_cpu} and the mean CPU per VM category. Calendar features were not used, for the reason given above.
+
+Three baselines were implemented: persistence (the last value), a 6-step moving average and a seasonal-naive forecast with a two-hour period. Ridge regression was chosen as a simple linear model and gradient-boosted trees as a non-linear one. Each was used in two forms. The recursive form predicts one step ahead and feeds its own predictions back as inputs, while the direct form uses a single model with the forecast step (1 to 24) as an extra input. Both forms predict the change from the current value instead of the level, which keeps their forecasts close to the last observation.
+
+The active VM count was forecast with persistence. A forecast based on VM lifetimes would have required deletion times, which are not available in practice, and the count did not change in the data anyway.
+
+% ------------------------------------------------------------------
+\section{Validation methodology}
+
+An expanding-window backtest was used inside the 110 training rows. Each window was trained on all rows before its origin and then forecast the following 24 rows, which is the same task as the final forecast. The first origin had 62 rows of history and each later origin added 6 rows, giving five windows whose forecasts covered rows 62 to 109. The last window ends immediately before the holdout. All models and baselines were evaluated on the same windows, and the model with the lowest mean absolute error (MAE) was selected and refitted on all training data. This design reflects the production setting, in which a model is trained on all past data and asked to forecast the next two hours, but its five windows overlap and all come from the same part of the series.
+
+% ------------------------------------------------------------------
+\section{Results versus baseline}
+
+Performance was measured with MAE and RMSE in CPU percentage points. To compare models with the baseline, each model's MAE was divided by the MAE of persistence, so values below 1 indicate an improvement. Since the denominator is the baseline error and not the CPU value, there is no problem with values close to zero.
+
+\begin{table}[H]
+  \centering
+  \small
+  \begin{tabular}{lrrrrrr}
+    \toprule
+    & \multicolumn{3}{c}{Validation (5 windows)} & \multicolumn{3}{c}{Holdout} \\
+    \cmidrule(lr){2-4}\cmidrule(lr){5-7}
+    Model & MAE & RMSE & Rel.\ MAE & MAE & RMSE & Rel.\ MAE \\
+    \midrule
+    \m{ridge\_recursive} (selected) & 0.118 & 0.145 & 0.62 & 0.290 & 0.349 & 1.98 \\
+    \m{boosting\_recursive} & 0.124 & 0.165 & 0.66 & 0.176 & 0.210 & 1.20 \\
+    \m{persistence} & 0.189 & 0.241 & 1.00 & 0.147 & 0.185 & 1.00 \\
+    \m{moving\_average\_6} & 0.237 & 0.288 & 1.26 & 0.134 & 0.171 & 0.91 \\
+    \m{seasonal\_naive\_24} & 0.321 & 0.362 & 1.70 & 0.146 & 0.167 & 1.00 \\
+    \m{boosting\_direct} & 0.329 & 0.396 & 1.74 & 0.217 & 0.259 & 1.48 \\
+    \m{ridge\_direct} & 0.448 & 0.481 & 2.37 & 0.130 & 0.159 & 0.88 \\
+    \bottomrule
+  \end{tabular}
+  \caption{Aggregate CPU errors. Rel.\ MAE is the model's MAE divided by the persistence MAE. The VM count forecast had an MAE of 0 on the holdout.}
+\end{table}
+
+The ranking changed almost completely between validation and holdout. The two recursive models were better than all baselines in validation but worse than all of them on the holdout. Direct ridge regression achieved the best holdout result, 12\% better than persistence, but it had been the worst model in validation and had over-forecast in every window. Its good holdout score therefore does not show that it is a better model, and choosing it after seeing the holdout would break the evaluation protocol. RMSE ranked the models in the same order as MAE, with RMSE/MAE between 1.1 and 1.3, which shows that the differences are not caused by a few large errors. The three baselines finished close to each other on the holdout. This suggests that, at this horizon and with this amount of data, the recent level of the series is the most reliable information available.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.72\textwidth]{relative_mae.png}
+  \caption{MAE relative to persistence in validation (blue) and on the holdout (orange).}
+\end{figure}
+
+% ------------------------------------------------------------------
+\section{Error and failure analysis}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\textwidth]{compare_ridge_recursive.png}
+  \caption{Left: holdout forecasts of the selected model and the baselines, with the headroom band. Right: validation MAE by forecast step.}
+\end{figure}
+
+The direction of the errors explains the change in ranking. In validation, persistence over-forecast by 0.16 points on average because CPU was falling, while the selected model was nearly unbiased but still under-forecast 72\% of the steps. On the holdout, the selected model predicted a steady decline from 9.18\% to 8.88\%, whereas the actual value rose from 9.17\% to 9.43\%, giving an average under-forecast of 0.27 points. For capacity planning, under-forecasting is the more harmful type of error.
+
+The cause is the period covered by validation. Every validation window started at a high level (9.33\% to 9.84\%) and ended lower (9.11\% to 9.37\%), so the models learned that a recent fall tends to continue. The holdout instead fell to 8.98\% at 9.25 hours and then rose to 9.64\% at 10.4 hours, where the selected model forecast 8.95\%, an error of 0.68 points. The series tends to return to its mean of about 9.4\%, but the models followed the recent trend. Because the five validation windows overlap and come from the same falling period, they did not give independent evidence, and this was the main weakness of the development process.
+
+Errors also depend on the forecast step. The error of persistence grew from 0.08 at 5 minutes to 0.31 at two hours, while the recursive models stayed between 0.04 and 0.23 in validation. Their advantage was therefore real within the falling period but did not carry over to a different pattern.
+
+Peak periods were defined as timestamps above the 90th percentile of the training data (9.67\%). In validation, the recursive models performed worst on these steps, with MAE of 0.17 for ridge and 0.29 for boosting, compared with 0.08 for persistence. No holdout timestamp exceeded this threshold, so a holdout peak MAE could not be calculated, but the holdout maximum of 9.64\% produced the selected model's largest error. The models are therefore least reliable when the fleet is busiest, which is when accurate forecasts matter most. Finally, the headroom margin of 0.238 points, set at the 95th percentile of the selected model's validation shortfall, covered only 42\% of holdout steps instead of the intended 95\%.
+
+% ------------------------------------------------------------------
+\section{Capacity-planning recommendation}
+
+For the VM count, capacity should be planned on the current number of VMs, adjusted for any creations or deletions already scheduled by the platform. For CPU, the following policy is recommended.
+
+\begin{enumerate}
+  \item Use the last observed aggregate CPU as the base forecast, since persistence was the most consistent method across both periods.
+  \item Add a safety margin of 0.60 points, the 95th percentile of the largest rise within any two-hour window of the training data. From the last training value of 9.17\%, this provisions for 9.77\%, about 6.5\% above the current level.
+  \item Review capacity early if aggregate CPU exceeds the training 90th percentile (9.67\%) or if one of the most variable subscriptions shows a sharp increase.
+  \item Reserve a larger part of the margin for interactive VMs, which are busier, more variable and more sensitive to delays than delay-insensitive workloads.
+\end{enumerate}
+
+This margin rule was designed after the holdout had been scored and was not used to produce \m{predictions.csv}. When checked against the holdout, it covered all 24 steps, as the largest rise from the forecast origin was 0.47 points.
+
+The policy accepts some over-provisioning to avoid under-provisioning. Too little capacity leads to CPU contention, throttling and higher latency, which affect interactive users directly and can break service agreements. Too much capacity only costs idle resources, and at fleet level an extra 0.6 points on an average load of 9.4\% is a modest cost. Because the two errors have such different consequences, the margin is based on observed rises rather than on average error.
+
+% ------------------------------------------------------------------
+\section{Limitations and future work}
+
+The main limitation is the length of the data. With 134 points covering about 11 hours, the trace contains no daily cycle and only one kind of movement in the training period, and the validation windows are strongly correlated. The VM count did not change, so its forecast was not tested. Model selection used MAE, which treats over- and under-forecasting equally even though their costs differ. A selection rule that excluded models under-forecasting more than half of the time would have chosen recursive boosting instead (holdout MAE 0.176).
+
+Future work should include a feature that measures the distance from the running mean, so that models can learn the tendency to return to the average. With a longer trace, validation windows should cover both rising and falling periods. Quantile models could give prediction intervals directly, and separate forecasts for interactive and delay-insensitive VMs could support the segment-based part of the capacity policy.
+
+\vspace{1em}
+\textit{Reproduction:} \m{python -m cwfc.predict --data challenge\_data --output predictions.csv} (see README).
+
+\end{document}

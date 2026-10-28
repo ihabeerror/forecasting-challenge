@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -19,31 +20,59 @@ HOT_THRESHOLD = 50.0
 
 
 def load_readings(path: str) -> pd.DataFrame:
-    """Load per-VM CPU readings, sorted by timestamp then vm_id."""
-    readings = pd.read_csv(path)
-    return readings.sort_values(["timestamp", "vm_id"]).reset_index(drop=True)
+    """Load per-VM CPU readings, keep valid ones, sort by timestamp then vm_id."""
+    raw = pd.read_csv(path)
+    readings = clean_readings(raw)
+    dropped = len(raw) - len(readings)
+    if dropped:
+        warnings.warn(f"dropped {dropped} readings with missing avg_cpu or a duplicate (vm_id, timestamp)")
+    return readings
+
+
+def clean_readings(readings: pd.DataFrame) -> pd.DataFrame:
+    """Keep valid readings only: avg_cpu present, one row per (vm_id, timestamp).
+
+    A duplicate pair keeps its first row, so a VM is counted and weighted once.
+    """
+    valid = readings.dropna(subset=["timestamp", "vm_id", "avg_cpu"])
+    valid = valid.drop_duplicates(["timestamp", "vm_id"], keep="first")
+    return valid.sort_values(["timestamp", "vm_id"]).reset_index(drop=True)
 
 
 def build_target_series(readings: pd.DataFrame) -> pd.DataFrame:
-    """Collapse per-VM readings into one row per timestamp.
+    """Collapse per-VM readings into one row per timestamp on the 5-minute grid.
 
-    active_vm_count: distinct VMs with a reading at the timestamp.
-    aggregate_cpu_utilization: mean of VM-level avg_cpu; missing readings are
-    skipped by the mean, so the value is over the VMs actually reported.
+    active_vm_count: distinct VMs with a valid reading at the timestamp.
+    aggregate_cpu_utilization: mean of VM-level avg_cpu over those VMs.
+
+    Timestamps with no readings at all are added to the grid and filled with
+    the last observed values (what an operator would know at that moment).
+    The `observed` column marks real rows; filled rows are never scored and
+    never used as holdout timestamps.
     """
     series = (
-        readings.groupby("timestamp")
+        clean_readings(readings).groupby("timestamp")
         .agg(
             active_vm_count=("vm_id", "nunique"),
             aggregate_cpu_utilization=("avg_cpu", "mean"),
         )
         .sort_index()
-        .reset_index()
     )
-    steps = series["timestamp"].diff().dropna()
-    if not (steps == STEP_SECONDS).all():
-        raise ValueError("timestamps are not evenly spaced at 5 minutes")
-    return series
+    if series.empty:
+        raise ValueError("no valid readings")
+    start = series.index[0]
+    if ((series.index - start) % STEP_SECONDS != 0).any():
+        raise ValueError("timestamps do not lie on a 5-minute grid")
+    grid = np.arange(start, series.index[-1] + STEP_SECONDS, STEP_SECONDS)
+    series = series.reindex(grid)
+    series.index.name = "timestamp"
+    series["observed"] = series[COUNT].notna()
+    missing = int((~series["observed"]).sum())
+    if missing:
+        warnings.warn(f"{missing} missing 5-minute timestamps filled with the last observed values")
+    series[[COUNT, TARGET]] = series[[COUNT, TARGET]].ffill()
+    series[COUNT] = series[COUNT].astype(int)
+    return series.reset_index()
 
 
 def active_vm_count_from_lifetimes(metadata: pd.DataFrame, timestamps: pd.Series) -> pd.Series:
@@ -58,6 +87,7 @@ def active_vm_count_from_lifetimes(metadata: pd.DataFrame, timestamps: pd.Series
 
 def build_fleet_series(readings: pd.DataFrame, metadata: pd.DataFrame) -> pd.DataFrame:
     """Per-timestamp fleet statistics observed at that timestamp."""
+    readings = clean_readings(readings)
     grouped = readings.groupby("timestamp")
     fleet = pd.DataFrame({
         "cpu_p95": grouped.avg_cpu.quantile(0.95),
@@ -73,12 +103,14 @@ def build_fleet_series(readings: pd.DataFrame, metadata: pd.DataFrame) -> pd.Dat
 
 def build_history(series: pd.DataFrame, fleet: pd.DataFrame) -> pd.DataFrame:
     """One row per timestamp: targets plus the fleet statistics observed then."""
-    history = series.merge(fleet, on="timestamp", how="left")
-    return history.sort_values("timestamp").reset_index(drop=True)
+    history = series.merge(fleet, on="timestamp", how="left").sort_values("timestamp").reset_index(drop=True)
+    columns = fleet_columns(history)
+    history[columns] = history[columns].ffill()  # gap rows carry the last observed fleet stats
+    return history
 
 
 def fleet_columns(history: pd.DataFrame) -> list[str]:
-    return [c for c in history.columns if c not in ("timestamp", COUNT, TARGET)]
+    return [c for c in history.columns if c not in ("timestamp", COUNT, TARGET, "observed")]
 
 
 def target_features(cpu: pd.Series) -> pd.DataFrame:
@@ -103,10 +135,23 @@ def origin_features(history: pd.DataFrame) -> pd.DataFrame:
 
 
 def split_train_holdout(frame: pd.DataFrame, horizon: int = HORIZON) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Chronological split: the final `horizon` rows are the holdout."""
-    if len(frame) <= horizon:
-        raise ValueError(f"need more than {horizon} rows, got {len(frame)}")
-    return frame.iloc[:-horizon].copy(), frame.iloc[-horizon:].copy()
+    """Chronological split: the final `horizon` observed timestamps are the holdout.
+
+    Training is every grid row before the first holdout timestamp. Gap-filled
+    rows inside the holdout span are dropped: they are neither trained on nor scored.
+    """
+    observed = frame["observed"] if "observed" in frame else pd.Series(True, index=frame.index)
+    observed_rows = frame[observed.astype(bool)]
+    if len(observed_rows) <= horizon:
+        raise ValueError(f"need more than {horizon} observed timestamps, got {len(observed_rows)}")
+    holdout = observed_rows.iloc[-horizon:].copy()
+    train = frame[frame["timestamp"] < holdout["timestamp"].iloc[0]].copy()
+    return train, holdout
+
+
+def steps_ahead(train: pd.DataFrame, holdout: pd.DataFrame) -> np.ndarray:
+    """Forecast step (1 = next 5 minutes) of each holdout timestamp from the training origin."""
+    return ((holdout["timestamp"].to_numpy() - train["timestamp"].iloc[-1]) // STEP_SECONDS).astype(int)
 
 
 def main() -> None:

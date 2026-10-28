@@ -15,7 +15,7 @@ import pandas as pd
 
 from cwfc.data_files import data_file
 from cwfc.evaluation import backtest, headroom_margin, mae_by_horizon, summarize
-from cwfc.metrics import mae, rmse
+from cwfc.metrics import mae, normalized_mae, rmse
 from cwfc.models import Persistence, default_forecasters
 from cwfc.preprocess import (
     COUNT,
@@ -26,6 +26,7 @@ from cwfc.preprocess import (
     build_target_series,
     load_readings,
     split_train_holdout,
+    steps_ahead,
 )
 from cwfc.validation import expanding_origins
 
@@ -34,13 +35,13 @@ ORIGIN_STEP = 6
 PEAK_QUANTILE = 0.9
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", default="challenge_data")
     parser.add_argument("--output", default="predictions.csv",
                         help="a bare file name is placed in --reports; a path is used as given")
     parser.add_argument("--reports", default="reports")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     data, reports = Path(args.data), Path(args.reports)
     reports.mkdir(parents=True, exist_ok=True)
     output = Path(args.output)
@@ -72,9 +73,14 @@ def main() -> None:
         print(f"validated {scores.shape[0]} models on {len(origins)} origins -> wrote {reports / 'validation_scores.csv'}")
     print(f"selected: {best_name}")
 
+    # Holdout timestamps are the last observed ones; if a gap falls inside them,
+    # forecast far enough ahead and keep the steps that match.
+    steps = steps_ahead(train, holdout)
+    n_steps = int(steps.max())
+
     # Final forecast from the end of the training window.
     best = next((f for f in forecasters if f.name == best_name), Persistence())
-    cpu_forecast = np.clip(best.fit(train).predict(train, HORIZON), 0.0, 100.0)
+    cpu_forecast = np.clip(best.fit(train).predict(train, n_steps)[steps - 1], 0.0, 100.0)
     count_forecast = int(train[COUNT].iloc[-1])
     predictions = pd.DataFrame({
         "timestamp": holdout["timestamp"].to_numpy(),
@@ -95,7 +101,7 @@ def main() -> None:
     holdout_rows, holdout_forecasts = [], []
     for forecaster in forecasters:
         try:
-            forecast = np.clip(forecaster.fit(train).predict(train, HORIZON), 0.0, 100.0)
+            forecast = np.clip(forecaster.fit(train).predict(train, n_steps)[steps - 1], 0.0, 100.0)
         except ValueError:
             continue
         actual = holdout[TARGET].to_numpy(dtype=float)
@@ -116,13 +122,16 @@ def main() -> None:
             "covered_by_margin": float(np.mean(actual <= forecast + margin)) if forecaster.name == best_name else np.nan,
         })
     holdout_scores = pd.DataFrame(holdout_rows)
-    reference = holdout_scores.loc[holdout_scores.model == "persistence", "mae"]
-    if len(reference) and reference.iloc[0] > 0:
-        holdout_scores["mae_vs_persistence"] = holdout_scores.mae / reference.iloc[0]
+    by_model = {f.model.iloc[0]: f.forecast.to_numpy() for f in holdout_forecasts}
+    if "persistence" in by_model:
+        actual = holdout[TARGET].to_numpy(dtype=float)
+        holdout_scores["mae_vs_persistence"] = [
+            normalized_mae(actual, by_model[name], by_model["persistence"]) for name in holdout_scores.model
+        ]
     holdout_scores["count_mae"] = mae(holdout[COUNT], np.full(len(holdout), count_forecast))
     holdout_scores.to_csv(reports / "holdout_scores.csv", index=False)
     pd.concat(holdout_forecasts, ignore_index=True).to_csv(reports / "holdout_forecasts.csv", index=False)
-    history[["timestamp", TARGET]].assign(split=["train"] * len(train) + ["holdout"] * len(holdout)) \
+    pd.concat([train.assign(split="train"), holdout.assign(split="holdout")])[["timestamp", TARGET, "split"]] \
         .to_csv(reports / "history.csv", index=False)
     print(f"wrote {reports / 'holdout_scores.csv'}, holdout_forecasts.csv, history.csv")
 

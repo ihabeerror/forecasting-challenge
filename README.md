@@ -69,9 +69,14 @@ python -m pytest -q                                        # tests
 - `active_vm_count` is the number of distinct VMs reporting.
 - `aggregate_cpu_utilization` is the mean of their `avg_cpu`.
 
-**Missing readings and gaps.** The release has no null values, no duplicate (VM, timestamp) pairs and no gaps in the 5-minute cadence (`cwfc.eda` checks this). The mean is taken over the VMs reporting at each timestamp. Nothing is resampled or imputed. If the 5-minute spacing is ever broken, `build_target_series` raises an error instead of filling it silently.
+**Missing readings and gaps.** The release has no null values, no duplicate (VM, timestamp) pairs and no gaps in the 5-minute cadence (`cwfc.eda` checks this), so nothing is imputed for it. The pipeline still handles them for other data, with a warning each time:
+- A reading with no `avg_cpu` is dropped, so that VM does not count as active at that timestamp. A duplicate (VM, timestamp) row keeps its first reading, so each VM is counted and weighted once.
+- The mean is taken over the VMs with a valid reading at each timestamp.
+- A timestamp with no readings at all is added to the 5-minute grid and filled with the last observed values, which is what an operator would know at that moment. These rows are marked as not observed. They keep lags and rolling features on a regular grid, but they are never scored in validation and never used as holdout timestamps.
+- The holdout is the last 24 *observed* timestamps. If a gap falls inside them, the model forecasts far enough ahead and the steps that match those timestamps are kept.
+- Timestamps that are not on a 5-minute grid stop the pipeline with an error.
 
-**Split.** The last 24 timestamps are the holdout and the rest is training. Holdout values are never used for fitting, feature selection, tuning or model selection. They are read only after `predictions.csv` is written, to score the result.
+**Split.** The last 24 observed timestamps are the holdout and the rest is training. Holdout values are never used for fitting, feature selection, tuning or model selection. They are read only after `predictions.csv` is written, to score the result.
 
 **Features.** Each forecast origin uses only rows at or before it:
 - current CPU

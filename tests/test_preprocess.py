@@ -3,10 +3,13 @@ import pandas as pd
 import pytest
 
 from cwfc.preprocess import (
+    COUNT,
     TARGET,
     active_vm_count_from_lifetimes,
+    build_target_series,
     origin_features,
     split_train_holdout,
+    steps_ahead,
 )
 
 
@@ -56,3 +59,39 @@ def test_active_count_from_lifetimes():
     })
     ts = pd.Series([0, 300, 600, 1200])
     assert active_vm_count_from_lifetimes(metadata, ts).tolist() == [2, 1, 2, 1]
+
+
+def _readings(timestamps, vms=("a", "b")) -> pd.DataFrame:
+    rows = [(t, vm, 10.0 + i) for t in timestamps for i, vm in enumerate(vms)]
+    return pd.DataFrame(rows, columns=["timestamp", "vm_id", "avg_cpu"])
+
+
+def test_targets_skip_missing_and_duplicate_readings():
+    readings = _readings([0, 300])
+    readings.loc[len(readings)] = [0, "c", np.nan]       # no valid reading: not active
+    readings.loc[len(readings)] = [300, "a", 90.0]       # duplicate (a, 300): ignored
+    series = build_target_series(readings)
+    assert series[COUNT].tolist() == [2, 2]
+    assert series[TARGET].tolist() == [10.5, 10.5]
+
+
+def test_targets_fill_missing_timestamps_and_mark_them():
+    with pytest.warns(UserWarning, match="1 missing"):
+        series = build_target_series(_readings([0, 300, 900]))
+    assert series["timestamp"].tolist() == [0, 300, 600, 900]
+    assert series["observed"].tolist() == [True, True, False, True]
+    assert series.loc[2, COUNT] == 2 and series.loc[2, TARGET] == 10.5
+
+
+def test_targets_reject_off_grid_timestamps():
+    with pytest.raises(ValueError):
+        build_target_series(_readings([0, 300, 450]))
+
+
+def test_split_holdout_uses_observed_timestamps_only():
+    history = _toy_history(30).assign(observed=True)
+    history.loc[20, "observed"] = False                  # gap inside the holdout span
+    train, holdout = split_train_holdout(history, horizon=24)
+    assert len(holdout) == 24 and history.loc[20, "timestamp"] not in holdout["timestamp"].tolist()
+    assert train["timestamp"].max() < holdout["timestamp"].min()
+    assert steps_ahead(train, holdout).tolist() == [s for s in range(1, 26) if s != 16]

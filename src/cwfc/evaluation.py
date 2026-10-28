@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from cwfc.metrics import mae, rmse
+from cwfc.metrics import mae, normalized_mae, rmse
 from cwfc.models import Forecaster
 from cwfc.preprocess import TARGET
 
@@ -13,11 +13,13 @@ def backtest(forecasters: list[Forecaster], history: pd.DataFrame, origins: list
 
     Returns one row per (model, origin, step). A forecaster that cannot be fit
     at some origin is dropped entirely so every model is scored on the same folds.
+    Gap-filled rows (observed == False) are forecast but not scored.
     """
     rows, failed = [], set()
     for origin in origins:
         known = history.iloc[:origin]
         actual = history.iloc[origin:origin + horizon]
+        scored = actual["observed"].to_numpy(dtype=bool) if "observed" in actual else np.ones(len(actual), bool)
         for forecaster in forecasters:
             if forecaster.name in failed:
                 continue
@@ -33,7 +35,7 @@ def backtest(forecasters: list[Forecaster], history: pd.DataFrame, origins: list
                 "timestamp": actual["timestamp"].to_numpy(),
                 "actual": actual[TARGET].to_numpy(dtype=float),
                 "forecast": forecast,
-            }))
+            })[scored])
     if not rows:
         return pd.DataFrame(columns=["model", "origin", "h", "timestamp", "actual", "forecast", "error"])
     results = pd.concat(rows, ignore_index=True)
@@ -50,7 +52,8 @@ def summarize(results: pd.DataFrame, peak_threshold: float, reference: str = "pe
     bias: mean(forecast - actual); negative means the model under-forecasts.
     under_rate: share of steps where the actual exceeded the forecast.
     """
-    ref_mae = mae(*_pair(results[results.model == reference])) if reference in set(results.model) else np.nan
+    keys = ["origin", "h"]
+    ref = results[results.model == reference].set_index(keys).forecast if reference in set(results.model) else None
     out = []
     for name, group in results.groupby("model", sort=False):
         peak = group[group.actual >= peak_threshold]
@@ -60,7 +63,10 @@ def summarize(results: pd.DataFrame, peak_threshold: float, reference: str = "pe
             "model": name,
             "mae": model_mae,
             "rmse": rmse(*_pair(group)),
-            "mae_vs_reference": model_mae / ref_mae if ref_mae else np.nan,
+            "mae_vs_reference": (
+                normalized_mae(group.actual, group.forecast, ref.loc[pd.MultiIndex.from_frame(group[keys])])
+                if ref is not None else np.nan
+            ),
             "peak_mae": mae(*_pair(peak)) if len(peak) else np.nan,
             "worst_fold_mae": fold_mae.max(),
             "bias": group.error.mean(),
